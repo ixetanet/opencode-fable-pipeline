@@ -1,83 +1,43 @@
 {
-  // OpenCode config for the /pipeline multi-model engineering pipeline.
+  // OpenCode config for the /fable-plan planning skill (see FABLE_PLAN.md).
   // Agents are defined in .opencode/agents/*.md; this file owns provider/model config.
+  // The Sol scout and the refusal fallback do NOT go through OpenCode — they run via
+  // `codex exec` on the OpenAI subscription, so no OpenAI provider entry is needed here.
   // Docs: https://opencode.ai/docs/config  https://opencode.ai/docs/providers
   "$schema": "https://opencode.ai/config.json",
   "provider": {
     "openrouter": {
       "models": {
-        // ---- DeepSeek V4 Flash — cheap workhorse (context-prep, plan-annotator, verifier,
-        // review-aggregator, post-mortem).
-        // Flash's real reasoning levels are high/xhigh only (low/medium map to high).
-        // Its tasks are mechanical, so cost is controlled via the output cap, not effort.
-        // NEVER send DeepSeek's native "max" effort value — OpenRouter rejects it with a 400;
-        // only OpenRouter-normalized values (low/medium/high) are valid here.
+        // ---- DeepSeek V4 Flash — the context-prep assembler (mechanical embed of the
+        // scout's manifest into context.md). Flash's real reasoning levels are high/xhigh
+        // only (low/medium map to high); its work is mechanical, so cost is controlled via
+        // the output cap, not effort. NEVER send DeepSeek's native "max" effort value —
+        // OpenRouter rejects it with a 400; only low/medium/high are valid here.
         "deepseek/deepseek-v4-flash": {
           "limit": { "context": 1048576, "output": 8192 },
           "options": { "reasoning": { "effort": "high" } }
         },
-        // ---- DeepSeek V4 Pro — the pipeline-orchestrator and the reviewer-deepseek-v4-pro
-        // general reviewer. high effort; xhigh has poor cost/quality ROI on V4.
-        "deepseek/deepseek-v4-pro": {
-          "limit": { "context": 1048576, "output": 32768 },
-          "options": { "reasoning": { "effort": "high" } }
-        },
-        // ---- GLM 5.2 via Exacto — the implementer. The :exacto suffix switches OpenRouter to
-        // quality-first provider routing ranked by real-world TOOL-CALLING accuracy — malformed
-        // tool calls are wasted round trips and a hidden cost, so the build agent gets it.
+        // ---- Claude Fable 5 — the planner and the optional planner-manifest pre-pass.
+        // PREMIUM ($10/$50 per 1M): at most 1x plan + 1x user-requested revision
+        // (+1x manifest pre-pass under --manifest) per run. Always high effort — never
+        // higher (xhigh multiplies thinking-token spend several-fold for marginal
+        // gains), never lower. OpenCode applies OpenRouter cache breakpoints for
+        // Claude models automatically (cache reads bill at ~0.1x), which is what makes
+        // the planner's bounded read turns affordable.
         //
-        // WARNING: the cheapest OpenRouter GLM 5.2 routes have 32K output caps and undisclosed
-        // quantization. If you see truncated diffs or flaky edits from the implementer, pin a
-        // known-good provider explicitly via OpenRouter provider preferences, e.g.:
-        //   "options": {
-        //     "reasoning": { "effort": "high" },
-        //     "provider": { "order": ["z-ai"], "allow_fallbacks": false, "quantizations": ["fp8", "bf16"] }
-        //   }
-        "z-ai/glm-5.2:exacto": {
-          "limit": { "context": 1048576, "output": 32768 },
-          "options": { "reasoning": { "effort": "high" } }
-        },
-        // ---- Kimi K2.7-Code — the reviewer-kimi-k2.7-code general reviewer (strongest on
-        // adversarial rubrics). Verified 2026-07-11: the plain
-        // "moonshotai/kimi-k2.7" slug does not exist on OpenRouter; k2.7-code is the current
-        // Kimi coding model. It is a thinking model but does NOT accept reasoning_effort
-        // (only reasoning on/off), so effort is deliberately left at the model default.
-        "moonshotai/kimi-k2.7-code": {
-          "limit": { "context": 262144, "output": 16384 }
-        },
-        // ---- MiniMax M3 — the reviewer-minimax-m3 general reviewer (cheapest pass; best on
-        // mechanical/checklist rubrics). NOT a reasoning-effort model on OpenRouter
-        // (no reasoning_effort in supported_parameters); sending an effort parameter may error.
-        // Deliberately no reasoning options here — do not add them.
-        "minimax/minimax-m3": {
-          "limit": { "context": 1048576, "output": 16384 }
-        },
-        // ---- Claude Fable 5 — planner, escalation-debugger, reviewer-fable (critical tier only).
-        // PREMIUM ($10/$50 per 1M): called at most 1x plan + 1x plan revision (human-requested at
-        // the checkpoint, or auto only on an objective COVERAGE-GAP in --no-checkpoint runs)
-        // + 1x escalation + optional 1x critical review pass. Always high effort — never higher
-        // (xhigh multiplies thinking-token spend several-fold for marginal gains), never lower.
+        // Output cap: OpenCode HARDCODES a global clamp of 32,000 output tokens per
+        // response (OUTPUT_TOKEN_MAX in provider/transform.ts: the effective cap is
+        // min(limit.output, 32000)) — this config can LOWER it but never raise it.
+        // A response includes the turn's thinking (~8K at high effort), and a
+        // response that hits the cap mid-tool-call is aborted invisibly
+        // (finish=length, "Tool execution aborted") — this killed two S5b plan runs
+        // on 2026-07-13. Mitigated in planner.md by writing the plan in chunks, each
+        // response well under the clamp. To genuinely raise the clamp, launch
+        // OpenCode with OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=65536 (env var only;
+        // this limit.output then becomes the effective ceiling).
         "anthropic/claude-fable-5": {
-          "limit": { "context": 1000000, "output": 32768 },
+          "limit": { "context": 1000000, "output": 65536 },
           "options": { "reasoning": { "effort": "high" } }
-        },
-        // ---- GPT 5.6 Sol via OpenRouter — planner FALLBACK TIER 2 only (planner-sol-openrouter),
-        // used when Fable's guardrails refuse a planning task AND the OpenAI subscription login is
-        // unavailable. Billed per token (unlike the subscription route). High effort, as everywhere.
-        "openai/gpt-5.6-sol": {
-          "options": { "reasoning": { "effort": "high" } }
-        }
-      }
-    },
-    // ---- OpenAI via subscription login (opencode auth) — NOT OpenRouter. GPT 5.6 Sol is the
-    // primary reviewer for ALL catalog angles: zero marginal cost on the subscription, and a
-    // third model family (distinct from the GLM implementer and the Fable planner). Effort high
-    // per the pipeline-wide ceiling (never xhigh). Real budget = subscription rate limits: on
-    // 429s/errors the orchestrator falls back per-angle to the OpenRouter fleet below.
-    "openai": {
-      "models": {
-        "gpt-5.6-sol": {
-          "options": { "reasoningEffort": "high" }
         }
       }
     }
